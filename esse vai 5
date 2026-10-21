@@ -10,7 +10,7 @@
   A "response" aparece no LCD 16x2 por ~6 segundos.
 
   Prioridade: proximidade (HC-SR04)
-    chegou (<=80 cm)  -> luz liga
+    chegou (<=80 cm)  -> luz liga + servo oscila
     saiu   (>=100 cm) -> luz e ventilador desligam
     voz / GPIO so funcionam com alguem perto; senão LCD: "Aproxime-se"
 
@@ -73,9 +73,12 @@ bool luzOn = false;
 bool presente = false; // prioridade: perto = voz ok; longe = ignora voz e apaga
 bool ventiladorAtivo = false;
 bool wsConnected = false;
+uint8_t contPerto = 0;
+uint8_t contLonge = 0;
 
 const float DISTANCIA_LIGAR_CM = 80.0f;     // chegou / está perto
 const float DISTANCIA_DESLIGAR_CM = 100.0f; // saiu (histerese)
+const uint8_t PRESENCA_CONFIRM = 2;        // leituras seguidas para mudar estado
 const int SERVO_MIN_ANGULO = 45;
 const int SERVO_MAX_ANGULO = 135;
 const int SERVO_CENTRO = 90;
@@ -95,6 +98,7 @@ unsigned long lcdMsgAte = 0;
 const unsigned long LCD_MSG_MS = 6000;
 
 void linhaLCD(uint8_t linha, const char* txt);
+float lerDistancia();
 
 // ===================== PWM RGB =====================
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -129,12 +133,16 @@ bool estaPerto() {
 
 void aoChegar() {
   presente = true;
+  contLonge = 0;
   aplicarRGB(255, 255, 255, "BRANCO");
-  Serial.println("[PROX] chegou -> luz ON");
+  // Como no sketch original: perto -> servo oscila
+  ventiladorAtivo = true;
+  Serial.println("[PROX] chegou -> luz ON + vent ON");
 }
 
 void aoSair() {
   presente = false;
+  contPerto = 0;
   aplicarRGB(0, 0, 0, "OFF");
   ventiladorAtivo = false;
   Serial.println("[PROX] saiu -> luz/vent OFF");
@@ -142,20 +150,46 @@ void aoSair() {
 
 void atualizarPresenca() {
   if (distanciaCm > 0 && distanciaCm <= DISTANCIA_LIGAR_CM) {
-    if (!presente) aoChegar();
+    contPerto++;
+    contLonge = 0;
+    if (!presente && contPerto >= PRESENCA_CONFIRM) {
+      aoChegar();
+    }
   } else if (distanciaCm < 0 || distanciaCm >= DISTANCIA_DESLIGAR_CM) {
-    if (presente) aoSair();
+    contLonge++;
+    contPerto = 0;
+    if (presente && contLonge >= PRESENCA_CONFIRM) {
+      aoSair();
+    }
+  } else {
+    // Zona morta 80–100 cm: mantém estado atual
+    contPerto = 0;
+    contLonge = 0;
   }
+}
+
+// Releitura na hora do comando (evita bloquear voz por eco falho antigo)
+bool confirmarPertoParaComando() {
+  float d = lerDistancia();
+  if (d > 0) {
+    distanciaCm = d;
+  }
+  Serial.printf("[SANTOS] dist=%.1f presente=%d\n", distanciaCm, presente ? 1 : 0);
+
+  if (distanciaCm > 0 && distanciaCm <= DISTANCIA_LIGAR_CM) {
+    if (!presente) aoChegar();
+    return true;
+  }
+  // Ainda na faixa de histerese e já marcado presente
+  if (presente && distanciaCm > 0 && distanciaCm < DISTANCIA_DESLIGAR_CM) {
+    return true;
+  }
+  return presente;
 }
 
 // ===================== COMANDOS SANTOS (GPIO via WS) =====================
 // Só valem com alguém perto. Ao sair, proximidade apaga tudo de novo.
 void aplicarComandoSantos(const char* component, const char* state) {
-  if (!estaPerto()) {
-    Serial.println("[SANTOS] ignorado: ninguem perto");
-    return;
-  }
-
   const bool high = (strcmp(state, "HIGH") == 0);
 
   if (strcmp(component, "luz") == 0) {
@@ -171,7 +205,15 @@ void aplicarComandoSantos(const char* component, const char* state) {
 
   if (strcmp(component, "ventilador") == 0) {
     ventiladorAtivo = high;
-    Serial.printf("[SANTOS] ventilador %s\n", high ? "HIGH" : "LOW");
+    if (high) {
+      // Garante que o loop do servo não fique preso no centro
+      if (anguloServo == SERVO_CENTRO) {
+        anguloServo = SERVO_MIN_ANGULO;
+        direcaoServo = 1;
+      }
+      servoVentilador.write(anguloServo);
+    }
+    Serial.printf("[SANTOS] ventilador %s (ang=%d)\n", high ? "HIGH" : "LOW", anguloServo);
     return;
   }
 
@@ -235,7 +277,7 @@ void processarMensagemWs(uint8_t* payload, size_t length) {
     return;
   }
 
-  if (!estaPerto()) {
+  if (!confirmarPertoParaComando()) {
     mostrarRespostaNoLCD("Aproxime-se");
     Serial.println("[SANTOS] voz/gpio bloqueados: longe");
     return;
@@ -247,7 +289,10 @@ void processarMensagemWs(uint8_t* payload, size_t length) {
   }
 
   JsonArray commands = doc["commands"].as<JsonArray>();
-  if (commands.isNull()) return;
+  if (commands.isNull()) {
+    Serial.println("[SANTOS] gpio sem commands");
+    return;
+  }
 
   for (JsonObject cmd : commands) {
     const char* component = cmd["component"] | "";
@@ -292,11 +337,6 @@ float lerDistancia() {
 }
 
 void atualizarVentilador() {
-  // Longe: sempre parado (proximidade manda). Perto: voz liga/desliga.
-  if (!estaPerto()) {
-    ventiladorAtivo = false;
-  }
-
   if (!ventiladorAtivo) {
     if (anguloServo != SERVO_CENTRO) {
       anguloServo = SERVO_CENTRO;
@@ -306,9 +346,10 @@ void atualizarVentilador() {
     return;
   }
 
-  if (millis() - tServo >= 25) {
+  // Oscila 45° <-> 135° enquanto ativo (presença ou voz)
+  if (millis() - tServo >= 20) {
     tServo = millis();
-    anguloServo += direcaoServo;
+    anguloServo += direcaoServo * 2; // passo maior = movimento mais visível
 
     if (anguloServo >= SERVO_MAX_ANGULO) {
       anguloServo = SERVO_MAX_ANGULO;
@@ -445,7 +486,7 @@ void handleCmd() {
     return;
   }
 
-  if (!estaPerto()) {
+  if (!confirmarPertoParaComando()) {
     responder("Aproxime-se para usar comandos");
     mostrarRespostaNoLCD("Aproxime-se");
     return;
