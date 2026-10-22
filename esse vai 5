@@ -9,12 +9,12 @@
       "commands": [{ "component": "luz"|"ventilador", "state": "HIGH"|"LOW" }] }
   A "response" aparece no LCD 16x2 por ~6 segundos.
 
-  Prioridade: proximidade (HC-SR04)
+  Proximidade (HC-SR04) — só automático, NÃO bloqueia voz:
     chegou (<=80 cm)  -> luz liga + servo oscila
     saiu   (>=100 cm) -> luz e ventilador desligam
-    voz / GPIO so funcionam com alguem perto; senão LCD: "Aproxime-se"
+  Comandos de voz/WS sempre são aplicados (mic fica no celular/PC).
 
-  Mapeamento (so se presente):
+  Mapeamento:
     luz HIGH/LOW, ventilador HIGH/LOW
 
   Bibliotecas (Arduino IDE -> Gerenciar bibliotecas):
@@ -70,7 +70,7 @@ WebSocketsClient webSocket;
 
 float distanciaCm = -1;
 bool luzOn = false;
-bool presente = false; // prioridade: perto = voz ok; longe = ignora voz e apaga
+bool presente = false; // só para auto ligar/apagar pela proximidade
 bool ventiladorAtivo = false;
 bool wsConnected = false;
 uint8_t contPerto = 0;
@@ -122,10 +122,6 @@ uint8_t clamp8(long v) {
 }
 
 // ===================== PRESENÇA (PRIORIDADE) =====================
-bool estaPerto() {
-  return presente;
-}
-
 void aoChegar() {
   presente = true;
   contLonge = 0;
@@ -168,38 +164,8 @@ void atualizarPresenca() {
   }
 }
 
-// Releitura na hora do comando
-bool confirmarPertoParaComando() {
-  float d = lerDistancia();
-  if (d > 0) {
-    distanciaCm = d;
-  }
-  Serial.printf("[SANTOS] dist=%.1f presente=%d\n",
-                distanciaCm, presente ? 1 : 0);
-
-  // Eco falho: se já estávamos presentes, libera o comando
-  if (d < 0) {
-    return presente;
-  }
-
-  if (d <= DISTANCIA_LIGAR_CM) {
-    if (!presente) aoChegar();
-    return true;
-  }
-
-  if (presente && d < DISTANCIA_DESLIGAR_CM) {
-    return true;
-  }
-
-  // Longe de verdade
-  if (d >= DISTANCIA_DESLIGAR_CM && presente) {
-    // não força aoSair aqui (deixa o loop com debounce); só bloqueia este comando
-  }
-  return false;
-}
-
 // ===================== COMANDOS SANTOS (GPIO via WS) =====================
-// Só valem com alguém perto. Ao sair, proximidade apaga tudo de novo.
+// Sempre aceitos (voz vem do celular; proximidade só controla auto ligar/apagar).
 void aplicarComandoSantos(const char* component, const char* state) {
   const bool high = (strcmp(state, "HIGH") == 0);
 
@@ -285,12 +251,6 @@ void processarMensagemWs(uint8_t* payload, size_t length) {
   }
   if (strcmp(type, "gpio") != 0) {
     Serial.printf("[WS] tipo ignorado: %s\n", type);
-    return;
-  }
-
-  if (!confirmarPertoParaComando()) {
-    mostrarRespostaNoLCD("Aproxime-se");
-    Serial.println("[SANTOS] voz/gpio bloqueados: longe");
     return;
   }
 
@@ -494,12 +454,6 @@ void handleEstado() {
 void handleCmd() {
   if (!server.hasArg("acao")) {
     server.send(400, "text/plain; charset=utf-8", "Parametro 'acao' ausente");
-    return;
-  }
-
-  if (!confirmarPertoParaComando()) {
-    responder("Aproxime-se para usar comandos");
-    mostrarRespostaNoLCD("Aproxime-se");
     return;
   }
 
