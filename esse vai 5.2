@@ -1,0 +1,565 @@
+/*
+  SMART HOME FRANCISCA - ESP32 + WebSocket + Gemini (via backend Node)
+
+  Este sketch recebe comandos GPIO do backend:
+    ws://BACKEND_HOST:BACKEND_PORT/ws?role=esp32
+
+  Protocolo (servidor -> ESP32):
+    { "type": "gpio", "response": "Ligando a luz.",
+      "commands": [{ "component": "luz"|"ventilador", "state": "HIGH"|"LOW" }] }
+  A "response" aparece no LCD 16x2 por ~6 segundos.
+
+  Proximidade (HC-SR04) — só automático, NÃO bloqueia voz:
+    chegou (<=80 cm)  -> luz liga + servo oscila
+    saiu   (>=100 cm) -> luz e ventilador desligam
+  Comandos de voz/WS sempre são aplicados (mic fica no celular/PC).
+
+  Mapeamento:
+    luz HIGH/LOW, ventilador HIGH/LOW
+
+  Bibliotecas (Arduino IDE -> Gerenciar bibliotecas):
+    - ESP32Servo
+    - LiquidCrystal I2C (ou LiquidCrystal_I2C)
+    - WebSockets by Markus Sattler (Links2004)
+    - ArduinoJson (v6 ou v7)
+
+  Fiação:
+    RGB R/G/B   GPIO 13 / 12 / 14
+    HC-SR04     TRIG 27, ECHO 26 (divisor no ECHO)
+    LCD I2C     SDA 32, SCL 33
+    Servo SG90  sinal GPIO 18
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+
+// ===================== CONFIGURAÇÃO (EDITE AQUI) =====================
+const char* WIFI_SSID = "Rede IFAL_Arapiraca";
+const char* WIFI_PASS = "redeifal";
+const char* AP_SSID   = "SmartHome-ESP32";
+
+// Local (PC na mesma Wi-Fi):
+//   BACKEND_HOST = "192.168.x.x"; BACKEND_PORT = 3000; BACKEND_USE_SSL = false;
+// Render (produção atual):
+const char* BACKEND_HOST = "backend-ia-esp.onrender.com";
+const uint16_t BACKEND_PORT = 443;
+const bool BACKEND_USE_SSL = true;
+const char* BACKEND_WS_PATH = "/ws?role=esp32";
+
+#define PIN_R     13
+#define PIN_G     12
+#define PIN_B     14
+#define PIN_TRIG  27
+#define PIN_ECHO  26
+#define PIN_SDA   32
+#define PIN_SCL   33
+#define PIN_SERVO 18
+
+#define LCD_ADDR  0x27
+
+// ===================== OBJETOS E ESTADO =====================
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+WebServer server(80);
+Servo servoVentilador;
+WebSocketsClient webSocket;
+
+float distanciaCm = -1;
+bool luzOn = false;
+bool presente = false; // só para auto ligar/apagar pela proximidade
+bool ventiladorAtivo = false;
+bool wsConnected = false;
+uint8_t contPerto = 0;
+uint8_t contLonge = 0;
+
+const float DISTANCIA_LIGAR_CM = 20.0f;    // chegou / está perto
+const float DISTANCIA_DESLIGAR_CM = 35.0f; // saiu (histerese)
+const uint8_t PRESENCA_CONFIRM = 2;        // leituras seguidas para mudar estado
+const int SERVO_MIN_ANGULO = 45;
+const int SERVO_MAX_ANGULO = 135;
+const int SERVO_CENTRO = 90;
+int anguloServo = SERVO_CENTRO;
+int direcaoServo = 1;
+unsigned long tServo = 0;
+String corNome = "OFF";
+uint8_t cr = 0, cg = 0, cb = 0;
+
+unsigned long tUS = 0, tLCD = 0, tWsPing = 0;
+uint8_t telaLCD = 0;
+
+// Mensagem da IA no LCD (16x2) por alguns segundos
+char lcdLinha0[17] = "";
+char lcdLinha1[17] = "";
+unsigned long lcdMsgAte = 0;
+const unsigned long LCD_MSG_MS = 6000;
+
+void linhaLCD(uint8_t linha, const char* txt);
+float lerDistancia();
+
+// ===================== RGB (digital) =====================
+// NÃO usar LEDC/PWM no RGB: o ESP32Servo no GPIO 18 também usa LEDC
+// e conflita (ventilador "ligava" o verde). Luz = só liga/desliga.
+
+void aplicarRGB(uint8_t r, uint8_t g, uint8_t b, const String& nome) {
+  cr = r;
+  cg = g;
+  cb = b;
+  corNome = nome;
+  luzOn = (r | g | b) != 0;
+  digitalWrite(PIN_R, r > 127 ? HIGH : LOW);
+  digitalWrite(PIN_G, g > 127 ? HIGH : LOW);
+  digitalWrite(PIN_B, b > 127 ? HIGH : LOW);
+}
+
+uint8_t clamp8(long v) {
+  if (v < 0) return 0;
+  if (v > 255) return 255;
+  return (uint8_t)v;
+}
+
+// ===================== PRESENÇA (PRIORIDADE) =====================
+void aoChegar() {
+  presente = true;
+  contLonge = 0;
+  aplicarRGB(255, 255, 255, "BRANCO");
+  // Como no sketch original: perto -> servo oscila
+  ventiladorAtivo = true;
+  Serial.println("[PROX] chegou -> luz ON + vent ON");
+}
+
+void aoSair() {
+  presente = false;
+  contPerto = 0;
+  aplicarRGB(0, 0, 0, "OFF");
+  ventiladorAtivo = false;
+  Serial.println("[PROX] saiu -> luz/vent OFF");
+}
+
+void atualizarPresenca() {
+  // Eco falho (-1): NÃO conta como "saiu" — senão a voz fica bloqueada o tempo todo
+  if (distanciaCm < 0) {
+    return;
+  }
+
+  if (distanciaCm <= DISTANCIA_LIGAR_CM) {
+    contPerto++;
+    contLonge = 0;
+    if (!presente && contPerto >= PRESENCA_CONFIRM) {
+      aoChegar();
+    }
+  } else if (distanciaCm >= DISTANCIA_DESLIGAR_CM) {
+    contLonge++;
+    contPerto = 0;
+    if (presente && contLonge >= PRESENCA_CONFIRM) {
+      aoSair();
+    }
+  } else {
+    // Zona morta 20–35 cm: mantém estado atual
+    contPerto = 0;
+    contLonge = 0;
+  }
+}
+
+// ===================== COMANDOS FRANCISCA (GPIO via WS) =====================
+// Sempre aceitos (voz vem do celular; proximidade só controla auto ligar/apagar).
+void aplicarComandoFrancisca(const char* component, const char* state) {
+  const bool high = (strcmp(state, "HIGH") == 0);
+
+  if (strcmp(component, "luz") == 0) {
+    if (high) {
+      aplicarRGB(255, 255, 255, "BRANCO");
+      Serial.println("[FRANCISCA] luz HIGH");
+    } else {
+      aplicarRGB(0, 0, 0, "OFF");
+      Serial.println("[FRANCISCA] luz LOW");
+    }
+    return;
+  }
+
+  if (strcmp(component, "ventilador") == 0) {
+    ventiladorAtivo = high;
+    if (high) {
+      // Garante que o loop do servo não fique preso no centro
+      if (anguloServo == SERVO_CENTRO) {
+        anguloServo = SERVO_MIN_ANGULO;
+        direcaoServo = 1;
+      }
+      servoVentilador.write(anguloServo);
+    }
+    Serial.printf("[FRANCISCA] ventilador %s (ang=%d)\n", high ? "HIGH" : "LOW", anguloServo);
+    return;
+  }
+
+  Serial.printf("[FRANCISCA] componente ignorado: %s\n", component);
+}
+
+void mostrarRespostaNoLCD(const char* texto) {
+  if (!texto || texto[0] == '\0') return;
+
+  // Remove acentos simples demais: LCD 16x2 — corta em 32 chars (2 linhas)
+  char buf[33];
+  size_t n = 0;
+  for (size_t i = 0; texto[i] != '\0' && n < 32; ++i) {
+    unsigned char c = (unsigned char)texto[i];
+    if (c < 32) continue;
+    // bytes UTF-8 multi: pula extras e usa '?'
+    if (c >= 0xC0) {
+      buf[n++] = '?';
+      if ((c & 0xE0) == 0xC0) i += 1;
+      else if ((c & 0xF0) == 0xE0) i += 2;
+      else if ((c & 0xF8) == 0xF0) i += 3;
+      continue;
+    }
+    buf[n++] = (char)c;
+  }
+  buf[n] = '\0';
+
+  memset(lcdLinha0, ' ', 16);
+  memset(lcdLinha1, ' ', 16);
+  lcdLinha0[16] = '\0';
+  lcdLinha1[16] = '\0';
+
+  size_t len = strlen(buf);
+  for (size_t i = 0; i < 16 && i < len; ++i) lcdLinha0[i] = buf[i];
+  for (size_t i = 0; i < 16 && (i + 16) < len; ++i) lcdLinha1[i] = buf[i + 16];
+
+  lcdMsgAte = millis() + LCD_MSG_MS;
+  linhaLCD(0, lcdLinha0);
+  linhaLCD(1, lcdLinha1);
+  Serial.printf("[LCD] %s | %s\n", lcdLinha0, lcdLinha1);
+}
+
+void processarMensagemWs(uint8_t* payload, size_t length) {
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.printf("[WS] JSON invalido: %s\n", err.c_str());
+    return;
+  }
+
+  const char* type = doc["type"] | "";
+  if (strcmp(type, "welcome") == 0) {
+    Serial.println("[WS] welcome do backend");
+    return;
+  }
+  if (strcmp(type, "pong") == 0) {
+    return;
+  }
+  if (strcmp(type, "gpio") != 0) {
+    Serial.printf("[WS] tipo ignorado: %s\n", type);
+    return;
+  }
+
+  const char* response = doc["response"] | "";
+  if (response[0] != '\0') {
+    mostrarRespostaNoLCD(response);
+  }
+
+  JsonArray commands = doc["commands"].as<JsonArray>();
+  if (commands.isNull()) {
+    Serial.println("[FRANCISCA] gpio sem commands");
+    return;
+  }
+
+  for (JsonObject cmd : commands) {
+    const char* component = cmd["component"] | "";
+    const char* state = cmd["state"] | "";
+    if (component[0] == '\0' || state[0] == '\0') continue;
+    aplicarComandoFrancisca(component, state);
+  }
+}
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      Serial.println("[WS] desconectado");
+      break;
+    case WStype_CONNECTED:
+      wsConnected = true;
+      Serial.printf("[WS] conectado: %s\n", payload ? (char*)payload : "");
+      break;
+    case WStype_TEXT:
+      processarMensagemWs(payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+// ===================== SENSORES =====================
+float lerDistancia() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long duracao = pulseIn(PIN_ECHO, HIGH, 30000);
+  if (duracao == 0) return -1;
+
+  float cm = duracao * 0.0343f / 2.0f;
+  if (cm < 2.0f || cm > 400.0f) return -1;
+  return cm;
+}
+
+void atualizarVentilador() {
+  if (!ventiladorAtivo) {
+    if (anguloServo != SERVO_CENTRO) {
+      anguloServo = SERVO_CENTRO;
+      servoVentilador.write(anguloServo);
+    }
+    direcaoServo = 1;
+    return;
+  }
+
+  // Oscila 45° <-> 135° enquanto ativo (presença ou voz)
+  if (millis() - tServo >= 20) {
+    tServo = millis();
+    anguloServo += direcaoServo * 2; // passo maior = movimento mais visível
+
+    if (anguloServo >= SERVO_MAX_ANGULO) {
+      anguloServo = SERVO_MAX_ANGULO;
+      direcaoServo = -1;
+    } else if (anguloServo <= SERVO_MIN_ANGULO) {
+      anguloServo = SERVO_MIN_ANGULO;
+      direcaoServo = 1;
+    }
+
+    servoVentilador.write(anguloServo);
+  }
+}
+
+void atualizarSensores() {
+  unsigned long agora = millis();
+  if (agora - tUS >= 250) {
+    tUS = agora;
+    distanciaCm = lerDistancia();
+    atualizarPresenca();
+  }
+
+  atualizarVentilador();
+}
+
+// ===================== LCD =====================
+void linhaLCD(uint8_t linha, const char* txt) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16.16s", txt);
+  lcd.setCursor(0, linha);
+  lcd.print(buf);
+}
+
+void atualizarLCD() {
+  // Enquanto a resposta da IA estiver ativa, não sobrescreve o LCD.
+  if (millis() < lcdMsgAte) return;
+
+  if (millis() - tLCD < 2000) return;
+  tLCD = millis();
+
+  char l0[17], l1[17];
+  if (telaLCD == 0) {
+    if (WiFi.status() == WL_CONNECTED) {
+      snprintf(l0, sizeof(l0), "IP:%s", WiFi.localIP().toString().c_str());
+    } else {
+      snprintf(l0, sizeof(l0), "AP:%s", WiFi.softAPIP().toString().c_str());
+    }
+    snprintf(l1, sizeof(l1), "WS:%s %s", wsConnected ? "OK" : "OFF", presente ? "PERTO" : "LONGE");
+  } else {
+    if (distanciaCm < 0) snprintf(l0, sizeof(l0), "DIST: SEM ECO");
+    else snprintf(l0, sizeof(l0), "DIST: %.1f cm", distanciaCm);
+    snprintf(l1, sizeof(l1), "LUZ:%s V:%s", luzOn ? "ON" : "OFF", ventiladorAtivo ? "ON" : "OFF");
+  }
+  linhaLCD(0, l0);
+  linhaLCD(1, l1);
+  telaLCD = (telaLCD + 1) % 2;
+}
+
+// ===================== WEB LOCAL (fallback / estado) =====================
+const char PAGINA[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="pt-BR"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Francisca</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:0 12px}
+.card{border:1px solid #ccc;border-radius:10px;padding:12px;margin:10px 0}
+button{padding:10px 14px;margin:4px;border:0;border-radius:8px;background:#2563eb;color:#fff}
+a{color:#2563eb}
+</style></head><body>
+<h1>ESP32 Francisca</h1>
+<p>Voz e IA ficam no app do PC: abra <b>http://IP_DO_PC:3000</b> e diga <b>Ei Francisca</b>.</p>
+<div class="card">
+ <div>Distância: <b id="d">--</b></div>
+ <div>Presença: <b id="pres">--</b></div>
+ <div>Luz: <b id="luz">--</b></div>
+ <div>Ventilador: <b id="fan">--</b></div>
+ <div>WS: <b id="ws">--</b></div>
+</div>
+<div class="card">
+ <button onclick="c('luz_on')">Ligar luz</button>
+ <button onclick="c('luz_off')">Desligar luz</button>
+ <button onclick="c('vent_on')">Ventilador ON</button>
+ <button onclick="c('vent_off')">Ventilador OFF</button>
+</div>
+<script>
+async function est(){
+ try{
+  const j=await (await fetch('/estado')).json();
+  d.textContent=j.dist<0?'--':j.dist+' cm';
+  pres.textContent=j.presente?'PERTO':'LONGE';
+  luz.textContent=j.luz?'ON':'OFF';
+  fan.textContent=j.vent?'ON':'OFF';
+  ws.textContent=j.ws?'OK':'OFF';
+ }catch(e){}
+}
+async function c(acao){ await fetch('/cmd?acao='+acao); est(); }
+est(); setInterval(est,2000);
+</script></body></html>
+)HTML";
+
+String jsonEstado() {
+  char dist[16];
+  if (distanciaCm < 0) snprintf(dist, sizeof(dist), "-1");
+  else snprintf(dist, sizeof(dist), "%.1f", distanciaCm);
+
+  char json[192];
+  snprintf(json, sizeof(json),
+           "{\"dist\":%s,\"luz\":%s,\"rgb\":\"%s\",\"presente\":%s,\"vent\":%s,\"ws\":%s}",
+           dist,
+           luzOn ? "true" : "false",
+           corNome.c_str(),
+           presente ? "true" : "false",
+           ventiladorAtivo ? "true" : "false",
+           wsConnected ? "true" : "false");
+  return String(json);
+}
+
+void responder(const char* msg) {
+  Serial.printf("[RESP] %s\n", msg);
+  server.send(200, "text/plain; charset=utf-8", msg);
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html; charset=utf-8", PAGINA);
+}
+
+void handleEstado() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", jsonEstado());
+}
+
+void handleCmd() {
+  if (!server.hasArg("acao")) {
+    server.send(400, "text/plain; charset=utf-8", "Parametro 'acao' ausente");
+    return;
+  }
+
+  String acao = server.arg("acao");
+
+  if (acao == "luz_on") {
+    aplicarComandoFrancisca("luz", "HIGH");
+    responder("Luz ligada");
+  } else if (acao == "luz_off" || acao == "rgb_off") {
+    aplicarComandoFrancisca("luz", "LOW");
+    responder("Luz desligada");
+  } else if (acao == "vent_on") {
+    aplicarComandoFrancisca("ventilador", "HIGH");
+    responder("Ventilador ativado");
+  } else if (acao == "vent_off") {
+    aplicarComandoFrancisca("ventilador", "LOW");
+    responder("Ventilador desligado");
+  } else {
+    server.send(400, "text/plain; charset=utf-8", "Acao nao reconhecida");
+  }
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println();
+  Serial.println("Smart Home Francisca (ESP32 + WS)");
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  pinMode(PIN_R, OUTPUT);
+  pinMode(PIN_G, OUTPUT);
+  pinMode(PIN_B, OUTPUT);
+  digitalWrite(PIN_R, LOW);
+  digitalWrite(PIN_G, LOW);
+  digitalWrite(PIN_B, LOW);
+  aplicarRGB(0, 0, 0, "OFF");
+
+  // Servo no GPIO 18 — único uso de LEDC/PWM neste sketch
+  servoVentilador.setPeriodHertz(50);
+  servoVentilador.attach(PIN_SERVO, 500, 2400);
+  servoVentilador.write(SERVO_CENTRO);
+  anguloServo = SERVO_CENTRO;
+
+  Wire.setPins(PIN_SDA, PIN_SCL);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  lcd.init();
+  lcd.backlight();
+  linhaLCD(0, "Francisca");
+  linhaLCD(1, "WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("IP ESP32: " + WiFi.localIP().toString());
+    linhaLCD(0, "IP:");
+    linhaLCD(1, WiFi.localIP().toString().c_str());
+
+    if (BACKEND_USE_SSL) {
+      // Render / HTTPS: wss://HOST/ws?role=esp32
+      webSocket.beginSSL(BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH);
+      Serial.printf("WSS -> %s:%u%s\n", BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH);
+    } else {
+      webSocket.begin(BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH);
+      Serial.printf("WS -> %s:%u%s\n", BACKEND_HOST, BACKEND_PORT, BACKEND_WS_PATH);
+    }
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(3000);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID);
+    Serial.println("AP: " + WiFi.softAPIP().toString());
+    linhaLCD(0, "AP SmartHome");
+    linhaLCD(1, WiFi.softAPIP().toString().c_str());
+  }
+
+  delay(2000);
+  tLCD = millis() - 3000;
+
+  server.on("/", handleRoot);
+  server.on("/estado", handleEstado);
+  server.on("/cmd", handleCmd);
+  server.begin();
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    webSocket.loop();
+    if (wsConnected && millis() - tWsPing >= 20000) {
+      tWsPing = millis();
+      webSocket.sendTXT("{\"type\":\"ping\"}");
+    }
+  }
+
+  server.handleClient();
+  atualizarSensores();
+  atualizarLCD();
+}
