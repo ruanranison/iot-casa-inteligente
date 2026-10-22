@@ -100,14 +100,9 @@ const unsigned long LCD_MSG_MS = 6000;
 void linhaLCD(uint8_t linha, const char* txt);
 float lerDistancia();
 
-// ===================== PWM RGB =====================
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define PWM_INIT(pin, ch) ledcAttach(pin, 5000, 8)
-  #define PWM_WRITE(pin, ch, v) ledcWrite(pin, v)
-#else
-  #define PWM_INIT(pin, ch) do { ledcSetup(ch, 5000, 8); ledcAttachPin(pin, ch); } while (0)
-  #define PWM_WRITE(pin, ch, v) ledcWrite(ch, v)
-#endif
+// ===================== RGB (digital) =====================
+// NÃO usar LEDC/PWM no RGB: o ESP32Servo no GPIO 18 também usa LEDC
+// e conflita (ventilador "ligava" o verde). Luz = só liga/desliga.
 
 void aplicarRGB(uint8_t r, uint8_t g, uint8_t b, const String& nome) {
   cr = r;
@@ -115,9 +110,9 @@ void aplicarRGB(uint8_t r, uint8_t g, uint8_t b, const String& nome) {
   cb = b;
   corNome = nome;
   luzOn = (r | g | b) != 0;
-  PWM_WRITE(PIN_R, 0, r);
-  PWM_WRITE(PIN_G, 1, g);
-  PWM_WRITE(PIN_B, 2, b);
+  digitalWrite(PIN_R, r > 127 ? HIGH : LOW);
+  digitalWrite(PIN_G, g > 127 ? HIGH : LOW);
+  digitalWrite(PIN_B, b > 127 ? HIGH : LOW);
 }
 
 uint8_t clamp8(long v) {
@@ -149,13 +144,18 @@ void aoSair() {
 }
 
 void atualizarPresenca() {
-  if (distanciaCm > 0 && distanciaCm <= DISTANCIA_LIGAR_CM) {
+  // Eco falho (-1): NÃO conta como "saiu" — senão a voz fica bloqueada o tempo todo
+  if (distanciaCm < 0) {
+    return;
+  }
+
+  if (distanciaCm <= DISTANCIA_LIGAR_CM) {
     contPerto++;
     contLonge = 0;
     if (!presente && contPerto >= PRESENCA_CONFIRM) {
       aoChegar();
     }
-  } else if (distanciaCm < 0 || distanciaCm >= DISTANCIA_DESLIGAR_CM) {
+  } else if (distanciaCm >= DISTANCIA_DESLIGAR_CM) {
     contLonge++;
     contPerto = 0;
     if (presente && contLonge >= PRESENCA_CONFIRM) {
@@ -168,23 +168,34 @@ void atualizarPresenca() {
   }
 }
 
-// Releitura na hora do comando (evita bloquear voz por eco falho antigo)
+// Releitura na hora do comando
 bool confirmarPertoParaComando() {
   float d = lerDistancia();
   if (d > 0) {
     distanciaCm = d;
   }
-  Serial.printf("[SANTOS] dist=%.1f presente=%d\n", distanciaCm, presente ? 1 : 0);
+  Serial.printf("[SANTOS] dist=%.1f presente=%d\n",
+                distanciaCm, presente ? 1 : 0);
 
-  if (distanciaCm > 0 && distanciaCm <= DISTANCIA_LIGAR_CM) {
+  // Eco falho: se já estávamos presentes, libera o comando
+  if (d < 0) {
+    return presente;
+  }
+
+  if (d <= DISTANCIA_LIGAR_CM) {
     if (!presente) aoChegar();
     return true;
   }
-  // Ainda na faixa de histerese e já marcado presente
-  if (presente && distanciaCm > 0 && distanciaCm < DISTANCIA_DESLIGAR_CM) {
+
+  if (presente && d < DISTANCIA_DESLIGAR_CM) {
     return true;
   }
-  return presente;
+
+  // Longe de verdade
+  if (d >= DISTANCIA_DESLIGAR_CM && presente) {
+    // não força aoSair aqui (deixa o loop com debounce); só bloqueia este comando
+  }
+  return false;
 }
 
 // ===================== COMANDOS SANTOS (GPIO via WS) =====================
@@ -525,12 +536,12 @@ void setup() {
   pinMode(PIN_R, OUTPUT);
   pinMode(PIN_G, OUTPUT);
   pinMode(PIN_B, OUTPUT);
+  digitalWrite(PIN_R, LOW);
   digitalWrite(PIN_G, LOW);
-  PWM_INIT(PIN_R, 0);
-  PWM_INIT(PIN_G, 1);
-  PWM_INIT(PIN_B, 2);
+  digitalWrite(PIN_B, LOW);
   aplicarRGB(0, 0, 0, "OFF");
 
+  // Servo no GPIO 18 — único uso de LEDC/PWM neste sketch
   servoVentilador.setPeriodHertz(50);
   servoVentilador.attach(PIN_SERVO, 500, 2400);
   servoVentilador.write(SERVO_CENTRO);
