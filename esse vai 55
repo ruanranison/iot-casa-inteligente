@@ -1,5 +1,5 @@
 /*
-  SMART HOME SANTOS - ESP32 + WebSocket + Gemini (via backend Node)
+  SMARTa HOME SANTOS - ESP32 + WebSocket + Gemini (via backend Node)
 
   Este sketch recebe comandos GPIO do backend:
     ws://BACKEND_HOST:BACKEND_PORT/ws?role=esp32
